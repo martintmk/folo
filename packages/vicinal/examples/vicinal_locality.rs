@@ -31,7 +31,7 @@ fn main() {
             println!("Task executed on processor {processor_id}");
         });
 
-        block_on(handle);
+        block_on(handle).unwrap();
         thread::sleep(Duration::from_millis(100));
     }
 }

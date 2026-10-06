@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use many_cpus::{ProcessorId, SystemHardware};
 
-use crate::ProcessorState;
+use crate::{ProcessorState, ShutdownPhase};
 
 /// Registry for managing per-processor state.
 ///
@@ -48,12 +48,44 @@ impl ProcessorRegistry {
     }
 
     #[cfg_attr(test, mutants::skip)] // Removing this causes timeouts (workers never stop)
-    pub(crate) fn signal_shutdown_all(&self) {
+    pub(crate) fn set_shutdown_phase_all(&self, phase: ShutdownPhase) {
         for state in &self.states {
             if let Some(s) = state.get() {
-                s.signal_shutdown();
+                s.set_shutdown_phase(phase);
             }
         }
+    }
+
+    pub(crate) fn discard_regular_tasks(&self) -> usize {
+        self.states
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(ProcessorState::discard_regular_tasks)
+            .sum()
+    }
+
+    pub(crate) fn discard_urgent_tasks(&self) -> usize {
+        self.states
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(ProcessorState::discard_urgent_tasks)
+            .sum()
+    }
+
+    pub(crate) fn pending_urgent_tasks(&self) -> usize {
+        self.states
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(ProcessorState::pending_urgent_tasks)
+            .sum()
+    }
+
+    pub(crate) fn pending_normal_tasks(&self) -> usize {
+        self.states
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(ProcessorState::pending_normal_tasks)
+            .sum()
     }
 
     #[cfg(test)]
@@ -77,8 +109,6 @@ impl ProcessorRegistry {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use many_cpus::fake::{HardwareBuilder, ProcessorBuilder};
 
     use super::*;
@@ -129,7 +159,7 @@ mod tests {
         let registry = ProcessorRegistry::new(&hardware);
 
         let state1 = registry.get_or_init(0);
-        state1.record_task_spawned();
+        state1.record_task_spawned(false);
 
         let state2 = registry.get_or_init(0);
         assert_eq!(state2.get_tasks_spawned(), 1);
@@ -139,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_shutdown_all_signals_all_initialized() {
+    fn set_shutdown_phase_all_updates_all_initialized() {
         let hardware = fake_hardware(4);
         let registry = ProcessorRegistry::new(&hardware);
 
@@ -147,13 +177,13 @@ mod tests {
         let state0 = registry.get_or_init(0);
         let state1 = registry.get_or_init(1);
 
-        assert!(!state0.shutdown_flag.load(Ordering::Acquire));
-        assert!(!state1.shutdown_flag.load(Ordering::Acquire));
+        assert_eq!(state0.shutdown_phase(), ShutdownPhase::Running);
+        assert_eq!(state1.shutdown_phase(), ShutdownPhase::Running);
 
-        registry.signal_shutdown_all();
+        registry.set_shutdown_phase_all(ShutdownPhase::DrainingNormal);
 
-        assert!(state0.shutdown_flag.load(Ordering::Acquire));
-        assert!(state1.shutdown_flag.load(Ordering::Acquire));
+        assert_eq!(state0.shutdown_phase(), ShutdownPhase::DrainingNormal);
+        assert_eq!(state1.shutdown_phase(), ShutdownPhase::DrainingNormal);
     }
 
     #[test]

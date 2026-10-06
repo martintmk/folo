@@ -82,7 +82,7 @@ fn entrypoint(c: &mut Criterion) {
 
             for _ in 0..iterations {
                 let handle = scheduler.spawn(|| black_box(simulate_work()));
-                black_box(block_on(handle));
+                black_box(block_on(handle).unwrap());
             }
 
             start.elapsed()
@@ -113,7 +113,7 @@ fn entrypoint(c: &mut Criterion) {
                     reason = "we reuse the vector in the next iteration"
                 )]
                 for handle in handles.drain(..) {
-                    black_box(block_on(handle));
+                    black_box(block_on(handle).unwrap());
                 }
             }
 
@@ -139,7 +139,7 @@ fn entrypoint(c: &mut Criterion) {
 
             for _ in 0..iterations {
                 let handle = scheduler.spawn_urgent(|| black_box(simulate_work()));
-                black_box(block_on(handle));
+                black_box(block_on(handle).unwrap());
             }
 
             start.elapsed()
@@ -174,7 +174,7 @@ fn entrypoint(c: &mut Criterion) {
                     reason = "we reuse the vector in the next iteration"
                 )]
                 for handle in handles.drain(..) {
-                    black_box(block_on(handle));
+                    black_box(block_on(handle).unwrap());
                 }
             }
 

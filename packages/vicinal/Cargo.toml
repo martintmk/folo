@@ -2,7 +2,7 @@
 name = "vicinal"
 description = "Processor-local worker pool that schedules tasks in the vicinity of the caller"
 publish = true
-version = "0.1.45"
+version = "0.2.0"
 
 authors.workspace = true
 edition.workspace = true
@@ -16,10 +16,13 @@ all-features = true
 
 # Baseline of external types intentionally exposed in the public API. Cross-crate
 # first-party types are listed individually by their canonical defining crate
-# (many_cpus re-exports `SystemHardware` from its `many_cpus_impl` partition).
+# (many_cpus re-exports these from its `many_cpus_impl` partition).
 # Ref: docs/external-types.md.
 [package.metadata.cargo_check_external_types]
-allowed_external_types = ["many_cpus_impl::system_hardware::SystemHardware"]
+allowed_external_types = [
+    "many_cpus_impl::processor_set::ProcessorSet",
+    "many_cpus_impl::system_hardware::SystemHardware",
+]
 
 [features]
 default = []

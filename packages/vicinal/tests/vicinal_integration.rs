@@ -3,8 +3,9 @@
 //! These tests verify full pool functionality with real threads.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use events_once::EventPool;
 use futures::executor::block_on;
@@ -23,7 +24,7 @@ fn spawn_and_await_value() {
         let handle = scheduler.spawn(|| 42);
         let result = block_on(handle);
 
-        assert_eq!(result, 42);
+        assert_eq!(result.unwrap(), 42);
     });
 }
 
@@ -34,19 +35,18 @@ fn spawn_and_await_unit() {
         let scheduler = pool.scheduler();
 
         let handle = scheduler.spawn(|| {});
-        block_on(handle);
+        block_on(handle).unwrap();
     });
 }
 
 #[test]
-#[should_panic]
 fn spawn_and_await_panic() {
     with_watchdog(|| {
         let pool = Pool::new();
         let scheduler = pool.scheduler();
 
         let handle = scheduler.spawn(|| panic!("intentional panic"));
-        block_on(handle);
+        assert!(block_on(handle).unwrap_err().is_panic());
     });
 }
 
@@ -60,8 +60,8 @@ fn clone_scheduler_spawn_from_both() {
         let handle1 = scheduler1.spawn(|| 1);
         let handle2 = scheduler2.spawn(|| 2);
 
-        assert_eq!(block_on(handle1), 1);
-        assert_eq!(block_on(handle2), 2);
+        assert_eq!(block_on(handle1).unwrap(), 1);
+        assert_eq!(block_on(handle2).unwrap(), 2);
     });
 }
 
@@ -74,8 +74,8 @@ fn nested_spawn_via_captured_scheduler() {
         let scheduler_clone = scheduler.clone();
         let outer_handle = scheduler.spawn(move || scheduler_clone.spawn(|| 99));
 
-        let inner_handle = block_on(outer_handle);
-        let result = block_on(inner_handle);
+        let inner_handle = block_on(outer_handle).unwrap();
+        let result = block_on(inner_handle).unwrap();
 
         assert_eq!(result, 99);
     });
@@ -96,7 +96,7 @@ fn drop_pool_after_awaiting_task() {
         let scheduler = pool.scheduler();
 
         let handle = scheduler.spawn(|| 42);
-        assert_eq!(block_on(handle), 42);
+        assert_eq!(block_on(handle).unwrap(), 42);
 
         drop(pool);
     });
@@ -115,7 +115,7 @@ fn spawn_many_tasks_await_all() {
             .map(|i| scheduler.spawn(move || i * 2))
             .enumerate()
         {
-            assert_eq!(block_on(handle), i * 2);
+            assert_eq!(block_on(handle).unwrap(), i * 2);
         }
     });
 }
@@ -128,7 +128,7 @@ fn scheduler_sent_to_another_thread() {
 
         let handle = thread::spawn(move || {
             let task_handle = scheduler.spawn(|| 123);
-            block_on(task_handle)
+            block_on(task_handle).unwrap()
         });
 
         let result = handle.join().unwrap();
@@ -171,7 +171,7 @@ fn concurrent_spawns_from_multiple_threads() {
                     .collect();
 
                 for (i, handle) in handles.into_iter().enumerate() {
-                    assert_eq!(block_on(handle), i);
+                    assert_eq!(block_on(handle).unwrap(), i);
                 }
             })
         })
@@ -267,7 +267,7 @@ fn spawn_and_await_with_fake_hardware() {
         let scheduler = pool.scheduler();
 
         let handle = scheduler.spawn(|| 42);
-        assert_eq!(block_on(handle), 42);
+        assert_eq!(block_on(handle).unwrap(), 42);
     });
 }
 
@@ -286,7 +286,7 @@ fn spawn_many_tasks_with_single_processor_hardware() {
             .map(|i| scheduler.spawn(move || i))
             .enumerate()
         {
-            assert_eq!(block_on(handle), i);
+            assert_eq!(block_on(handle).unwrap(), i);
         }
     });
 }
@@ -346,7 +346,7 @@ fn concurrent_spawns_with_fake_hardware() {
                     .collect();
 
                 for (i, handle) in handles.into_iter().enumerate() {
-                    assert_eq!(block_on(handle), i);
+                    assert_eq!(block_on(handle).unwrap(), i);
                 }
             })
         })
@@ -365,7 +365,6 @@ fn concurrent_spawns_with_fake_hardware() {
 }
 
 #[test]
-#[should_panic]
 fn spawn_and_await_panic_with_fake_hardware() {
     with_watchdog(|| {
         let hardware =
@@ -374,7 +373,7 @@ fn spawn_and_await_panic_with_fake_hardware() {
         let scheduler = pool.scheduler();
 
         let handle = scheduler.spawn(|| panic!("intentional panic"));
-        block_on(handle);
+        assert!(block_on(handle).unwrap_err().is_panic());
     });
 }
 
@@ -387,7 +386,7 @@ fn spawn_urgent_with_fake_hardware() {
         let scheduler = pool.scheduler();
 
         let handle = scheduler.spawn_urgent(|| "urgent result");
-        assert_eq!(block_on(handle), "urgent result");
+        assert_eq!(block_on(handle).unwrap(), "urgent result");
     });
 }
 
@@ -402,8 +401,100 @@ fn nested_spawn_with_fake_hardware() {
         let scheduler_clone = scheduler.clone();
         let outer_handle = scheduler.spawn(move || scheduler_clone.spawn(|| 99));
 
-        let inner_handle = block_on(outer_handle);
-        assert_eq!(block_on(inner_handle), 99);
+        let inner_handle = block_on(outer_handle).unwrap();
+        assert_eq!(block_on(inner_handle).unwrap(), 99);
+    });
+}
+
+#[test]
+fn shutdown_rejects_new_tasks_and_can_be_waited_on() {
+    with_watchdog(|| {
+        let hardware =
+            SystemHardware::fake(HardwareBuilder::from_counts(nz!(1_usize), nz!(1_usize)));
+        let pool = Pool::builder()
+            .hardware(hardware)
+            .max_workers(nz!(1_usize))
+            .build();
+        let scheduler = pool.scheduler();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let running = scheduler.spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            42
+        });
+        started_rx.recv().unwrap();
+        let accepted_before_shutdown = scheduler.spawn(|| 7);
+
+        pool.start_shutdown(Duration::from_secs(1), Duration::from_secs(1));
+        pool.start_shutdown(Duration::ZERO, Duration::ZERO);
+
+        let rejected = scheduler.spawn(|| 99);
+        assert!(block_on(rejected).unwrap_err().is_shutdown());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(block_on(running).unwrap(), 42);
+        assert_eq!(block_on(accepted_before_shutdown).unwrap(), 7);
+    });
+}
+
+#[test]
+fn shutdown_gives_urgent_tasks_a_separate_drain_window() {
+    with_watchdog(|| {
+        let hardware =
+            SystemHardware::fake(HardwareBuilder::from_counts(nz!(1_usize), nz!(1_usize)));
+        let pool = Pool::builder()
+            .hardware(hardware)
+            .max_workers(nz!(1_usize))
+            .build();
+        let scheduler = pool.scheduler();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let running = scheduler.spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let abandoned_normal = scheduler.spawn(|| 1);
+        let urgent = scheduler.spawn_urgent(|| 2);
+
+        pool.start_shutdown(Duration::from_secs(1), Duration::ZERO);
+        release_tx.send(()).unwrap();
+
+        block_on(running).unwrap();
+        assert!(block_on(abandoned_normal).unwrap_err().is_shutdown());
+        assert_eq!(block_on(urgent).unwrap(), 2);
+    });
+}
+
+#[test]
+fn shutdown_abandons_urgent_tasks_after_their_timeout() {
+    with_watchdog(|| {
+        let hardware =
+            SystemHardware::fake(HardwareBuilder::from_counts(nz!(1_usize), nz!(1_usize)));
+        let pool = Pool::builder()
+            .hardware(hardware)
+            .max_workers(nz!(1_usize))
+            .build();
+        let scheduler = pool.scheduler();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let running = scheduler.spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+        let urgent = scheduler.spawn_urgent(|| 2);
+
+        pool.start_shutdown(Duration::ZERO, Duration::ZERO);
+        assert!(block_on(urgent).unwrap_err().is_shutdown());
+
+        release_tx.send(()).unwrap();
+        block_on(running).unwrap();
     });
 }
 

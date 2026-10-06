@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use event_listener::Event;
 use events_once::EventLake;
@@ -10,13 +10,32 @@ use plurality::MultiPool;
 
 use crate::ErasedTaskHandle;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum ShutdownPhase {
+    Running,
+    DrainingUrgent,
+    DrainingNormal,
+    Stopping,
+}
+
+impl ShutdownPhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Running,
+            1 => Self::DrainingUrgent,
+            2 => Self::DrainingNormal,
+            3 => Self::Stopping,
+            _ => unreachable!("invalid shutdown phase"),
+        }
+    }
+}
+
 /// Everything a processor's worker threads share: the work they draw from, the storage that
 /// work lives in, and the signals that tell them to wake up or stop.
 ///
-/// One instance exists per processor that has ever had a task spawned on it, and every
-/// worker pinned to that processor operates on the same instance. Keeping the state
-/// per-processor rather than per-pool is what gives spawned work its locality: a task is
-/// queued on, allocated on, and executed on the processor that spawned it.
+/// Processor-local pools create one instance per processor that has received work. Fixed
+/// processor-set pools use one shared instance for all selected processors.
 pub(crate) struct ProcessorState {
     /// Queue for high-priority tasks. These are executed before regular tasks.
     pub(crate) urgent_queue: Mutex<VecDeque<ErasedTaskHandle>>,
@@ -27,12 +46,17 @@ pub(crate) struct ProcessorState {
     /// Event used to wake up sleeping workers when new tasks are added.
     pub(crate) wake_event: Event,
 
-    /// Flag indicating that the processor (and its workers) should shut down.
-    pub(crate) shutdown_flag: AtomicBool,
+    /// Current shutdown phase for the processor and its workers.
+    shutdown_phase: AtomicU8,
 
-    /// Flag indicating whether workers have been spawned for this processor.
-    /// Used for lazy initialization of workers.
-    pub(crate) workers_spawned: AtomicBool,
+    /// Number of live or starting workers for this scheduling domain.
+    active_workers: AtomicUsize,
+
+    /// Number of workers currently waiting for work.
+    idle_workers: AtomicUsize,
+
+    /// Monotonic index assigned to newly created workers.
+    next_worker_index: AtomicUsize,
 
     /// Backing storage for the task objects queued on this processor.
     ///
@@ -45,6 +69,12 @@ pub(crate) struct ProcessorState {
 
     /// Counter of total tasks spawned on this processor.
     pub(crate) tasks_spawned: AtomicU64,
+
+    /// Number of accepted urgent tasks that have not completed or been abandoned.
+    pending_urgent_tasks: AtomicUsize,
+
+    /// Number of accepted normal tasks that have not completed or been abandoned.
+    pending_normal_tasks: AtomicUsize,
 }
 
 impl ProcessorState {
@@ -53,25 +83,145 @@ impl ProcessorState {
             urgent_queue: Mutex::new(VecDeque::new()),
             regular_queue: Mutex::new(VecDeque::new()),
             wake_event: Event::new(),
-            shutdown_flag: AtomicBool::new(false),
-            workers_spawned: AtomicBool::new(false),
+            shutdown_phase: AtomicU8::new(ShutdownPhase::Running as u8),
+            active_workers: AtomicUsize::new(0),
+            idle_workers: AtomicUsize::new(0),
+            next_worker_index: AtomicUsize::new(0),
             task_pool: Mutex::new(MultiPool::new()),
             result_channel_pool: EventLake::new(),
             tasks_spawned: AtomicU64::new(0),
+            pending_urgent_tasks: AtomicUsize::new(0),
+            pending_normal_tasks: AtomicUsize::new(0),
         }
     }
 
     #[cfg_attr(test, mutants::skip)] // Removing this causes timeouts (workers never stop)
-    pub(crate) fn signal_shutdown(&self) {
+    pub(crate) fn set_shutdown_phase(&self, phase: ShutdownPhase) {
         // Release ordering ensures all prior task queue operations are visible to workers
-        // before they observe the shutdown flag.
-        self.shutdown_flag.store(true, Ordering::Release);
+        // before they observe the shutdown phase.
+        self.shutdown_phase.store(phase as u8, Ordering::Release);
         self.wake_event.notify(usize::MAX);
     }
 
-    pub(crate) fn record_task_spawned(&self) {
+    pub(crate) fn shutdown_phase(&self) -> ShutdownPhase {
+        ShutdownPhase::from_u8(self.shutdown_phase.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn try_reserve_idle_worker(&self) -> bool {
+        self.idle_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle_workers| {
+                idle_workers.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn try_add_worker(&self, max_workers: usize) -> Option<usize> {
+        self.active_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active_workers| {
+                if active_workers >= max_workers {
+                    None
+                } else {
+                    active_workers.checked_add(1)
+                }
+            })
+            .ok()?;
+
+        match self.next_worker_index.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |worker_index| worker_index.checked_add(1),
+        ) {
+            Ok(worker_index) => Some(worker_index),
+            Err(_) => {
+                self.worker_exited();
+                panic!("worker index overflowed usize");
+            }
+        }
+    }
+
+    pub(crate) fn worker_exited(&self) {
+        self.active_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active_workers| {
+                active_workers.checked_sub(1)
+            })
+            .expect("active worker count must be positive");
+    }
+
+    pub(crate) fn enter_idle(&self) {
+        self.idle_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle_workers| {
+                idle_workers.checked_add(1)
+            })
+            .expect("idle worker count overflowed usize");
+    }
+
+    pub(crate) fn leave_idle(&self) {
+        _ = self
+            .idle_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle_workers| {
+                idle_workers.checked_sub(1)
+            });
+    }
+
+    pub(crate) fn discard_regular_tasks(&self) -> usize {
+        let mut queue = self.regular_queue.lock().expect(crate::NEVER_POISONED);
+        let discarded = queue.len();
+        queue.clear();
+        Self::abandon_tasks(&self.pending_normal_tasks, discarded);
+        discarded
+    }
+
+    pub(crate) fn discard_urgent_tasks(&self) -> usize {
+        let mut queue = self.urgent_queue.lock().expect(crate::NEVER_POISONED);
+        let discarded = queue.len();
+        queue.clear();
+        Self::abandon_tasks(&self.pending_urgent_tasks, discarded);
+        discarded
+    }
+
+    pub(crate) fn record_task_spawned(&self, urgent: bool) {
         // Relaxed ordering is sufficient for a monotonic counter with no synchronization needs.
         self.tasks_spawned.fetch_add(1, Ordering::Relaxed);
+
+        let pending_tasks = if urgent {
+            &self.pending_urgent_tasks
+        } else {
+            &self.pending_normal_tasks
+        };
+        pending_tasks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending_tasks| {
+                pending_tasks.checked_add(1)
+            })
+            .expect("pending task count overflowed usize");
+    }
+
+    pub(crate) fn record_task_completed(&self, urgent: bool) {
+        let pending_tasks = if urgent {
+            &self.pending_urgent_tasks
+        } else {
+            &self.pending_normal_tasks
+        };
+        pending_tasks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending_tasks| {
+                pending_tasks.checked_sub(1)
+            })
+            .expect("pending task count must be positive");
+    }
+
+    pub(crate) fn pending_urgent_tasks(&self) -> usize {
+        self.pending_urgent_tasks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn pending_normal_tasks(&self) -> usize {
+        self.pending_normal_tasks.load(Ordering::Acquire)
+    }
+
+    fn abandon_tasks(pending_tasks: &AtomicUsize, abandoned: usize) {
+        pending_tasks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending_tasks| {
+                pending_tasks.checked_sub(abandoned)
+            })
+            .expect("abandoned task count must not exceed pending task count");
     }
 
     #[cfg(test)]
@@ -114,19 +264,19 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_flag_initially_false() {
+    fn shutdown_phase_initially_running() {
         let state = ProcessorState::new();
 
-        assert!(!state.shutdown_flag.load(Ordering::Acquire));
+        assert_eq!(state.shutdown_phase(), ShutdownPhase::Running);
     }
 
     #[test]
-    fn signal_shutdown_sets_flag() {
+    fn set_shutdown_phase_updates_phase() {
         let state = ProcessorState::new();
 
-        state.signal_shutdown();
+        state.set_shutdown_phase(ShutdownPhase::DrainingUrgent);
 
-        assert!(state.shutdown_flag.load(Ordering::Acquire));
+        assert_eq!(state.shutdown_phase(), ShutdownPhase::DrainingUrgent);
     }
 
     #[test]
@@ -140,9 +290,9 @@ mod tests {
     fn record_task_spawned_increments_counter() {
         let state = ProcessorState::new();
 
-        state.record_task_spawned();
-        state.record_task_spawned();
-        state.record_task_spawned();
+        state.record_task_spawned(false);
+        state.record_task_spawned(false);
+        state.record_task_spawned(false);
 
         assert_eq!(state.get_tasks_spawned(), 3);
     }

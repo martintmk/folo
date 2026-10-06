@@ -1,10 +1,11 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! Worker pool that schedules tasks on the same processor that spawned them.
+//! Hardware-aware worker pool for processor-local and fixed processor-set execution.
 //!
-//! This crate provides a worker pool where each task is executed on the same processor that
-//! spawned it, ensuring optimal cache locality and minimizing cross-processor data movement.
+//! By default, each task is executed on the same processor that spawned it, ensuring optimal cache
+//! locality and minimizing cross-processor data movement. A pool can instead be configured with a
+//! fixed [`many_cpus::ProcessorSet`] whose workers share tasks across selected processors.
 //!
 //! # Quick start
 //!
@@ -19,12 +20,12 @@
 //! let task1 = scheduler.spawn(|| 42);
 //! let _task2 = scheduler.spawn(|| println!("doing some stuff"));
 //!
-//! assert_eq!(task1.await, 42);
+//! assert_eq!(task1.await.unwrap(), 42);
 //!
 //! let scheduler2 = scheduler.clone();
 //! let task3 = scheduler.spawn(move || scheduler2.spawn(|| 55));
 //!
-//! assert_eq!(task3.await.await, 55);
+//! assert_eq!(task3.await.unwrap().await.unwrap(), 55);
 //! # });
 //! ```
 //!
@@ -32,6 +33,8 @@
 //!
 //! - **Single task latency on an idle pool** is prioritized. The expectation is that tasks are
 //!   short-lived so that the pool is often idle.
+//! - A fixed processor-set pool can be used as a general-purpose blocking pool, but it does not
+//!   grow dynamically. Every blocked task occupies one of the configured workers.
 //!
 //! # Shutdown behavior
 //!
@@ -42,9 +45,12 @@
 //! If you need to ensure all spawned tasks complete before shutdown, await their [`JoinHandle`]s
 //! before dropping the pool.
 //!
+//! [`Pool::start_shutdown`] starts a non-blocking timed shutdown. New tasks are rejected
+//! immediately. Urgent tasks drain first for their configured timeout, followed by normal tasks.
+//!
 //! # Panics
 //!
-//! If a task panics, the panic is captured and re-thrown when the [`JoinHandle`] is awaited.
+//! If a task panics, the panic is captured and returned as a [`JoinError`].
 //!
 //! # Platform support
 //!
@@ -72,7 +78,7 @@ pub use join_handle::*;
 pub(crate) use pool::PoolInner;
 pub use pool::*;
 pub(crate) use processor_registry::ProcessorRegistry;
-pub(crate) use processor_state::ProcessorState;
+pub(crate) use processor_state::{ProcessorState, ShutdownPhase};
 pub use scheduler::*;
 pub(crate) use task::*;
 pub(crate) use worker::*;

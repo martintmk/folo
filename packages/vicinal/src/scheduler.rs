@@ -1,6 +1,7 @@
 //! Scheduler for spawning tasks on the worker pool.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tracing::trace;
 
@@ -12,9 +13,8 @@ use crate::{
 
 /// A handle for spawning tasks on a [`Pool`][crate::Pool].
 ///
-/// The scheduler determines which processor to execute tasks on based on the processor
-/// that called `spawn()` or `spawn_urgent()`. This ensures cache locality by keeping
-/// data close to the code that processes it.
+/// Processor-local pools execute work near the caller. Fixed processor-set pools schedule work
+/// across their configured workers.
 ///
 /// # Cloning
 ///
@@ -38,8 +38,8 @@ use crate::{
 /// let scheduler2 = scheduler.clone();
 /// let handle2 = scheduler.spawn(move || scheduler2.spawn(|| "nested"));
 ///
-/// assert_eq!(handle1.await, "hello");
-/// assert_eq!(handle2.await.await, "nested");
+/// assert_eq!(handle1.await.unwrap(), "hello");
+/// assert_eq!(handle2.await.unwrap().await.unwrap(), "nested");
 /// # });
 /// ```
 #[derive(Clone, Debug)]
@@ -53,10 +53,11 @@ impl Scheduler {
         Self { inner }
     }
 
-    /// Spawns a task to be executed on the current processor.
+    /// Spawns a normal-priority task.
     ///
-    /// The task will be added to the regular (normal-priority) queue and executed
-    /// by a worker thread associated with the processor that called this method.
+    /// Processor-local pools execute the task on the processor that called this method. Pools
+    /// configured with [`PoolBuilder::processors`][crate::PoolBuilder::processors] execute it on
+    /// any worker in the fixed processor set.
     ///
     /// Spawned tasks may be executed in any order. Urgent tasks are scheduled
     /// preferentially but there is no hard guarantee that they will preempt all
@@ -66,10 +67,10 @@ impl Scheduler {
     ///
     /// A [`JoinHandle`] that can be awaited to get the task's return value.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If the task panics, the panic will be captured and re-thrown when the
-    /// [`JoinHandle`] is awaited.
+    /// Awaiting the handle returns a [`JoinError`][crate::JoinError] if the task panics or is
+    /// abandoned during shutdown.
     pub fn spawn<R, F>(&self, task: F) -> JoinHandle<R>
     where
         R: Send + 'static,
@@ -78,7 +79,7 @@ impl Scheduler {
         self.spawn_internal(task, false)
     }
 
-    /// Spawns an urgent (high-priority) task to be executed on the current processor.
+    /// Spawns an urgent (high-priority) task.
     ///
     /// Urgent tasks are executed before regular tasks. Use this for time-sensitive
     /// operations that should not wait behind a queue of regular work.
@@ -91,10 +92,10 @@ impl Scheduler {
     ///
     /// A [`JoinHandle`] that can be awaited to get the task's return value.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If the task panics, the panic will be captured and re-thrown when the
-    /// [`JoinHandle`] is awaited.
+    /// Awaiting the handle returns a [`JoinError`][crate::JoinError] if the task panics or is
+    /// abandoned during shutdown.
     pub fn spawn_urgent<R, F>(&self, task: F) -> JoinHandle<R>
     where
         R: Send + 'static,
@@ -103,7 +104,7 @@ impl Scheduler {
         self.spawn_internal(task, true)
     }
 
-    /// Spawns a fire-and-forget task on the current processor.
+    /// Spawns a normal-priority fire-and-forget task.
     ///
     /// Unlike [`spawn`](Self::spawn), this method does not return a [`JoinHandle`].
     /// The task's result is discarded, and panics are logged rather than propagated.
@@ -125,7 +126,7 @@ impl Scheduler {
         self.spawn_internal_and_forget(task, false);
     }
 
-    /// Spawns an urgent fire-and-forget task on the current processor.
+    /// Spawns an urgent fire-and-forget task.
     ///
     /// This is the fire-and-forget equivalent of [`spawn_urgent`](Self::spawn_urgent).
     /// The task is added to the high-priority queue but does not return a [`JoinHandle`].
@@ -149,15 +150,25 @@ impl Scheduler {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
+        let _admission = self.inner.admission.read().expect(NEVER_POISONED);
+
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            let (sender, receiver) = self.inner.rejected_result_channel_pool.rent();
+            drop(sender);
+            trace!(
+                pool_name = self.inner.pool_name.as_str(),
+                pool_id = self.inner.pool_id,
+                "rejected task because pool shutdown has started"
+            );
+            return JoinHandle::new(receiver);
+        }
+
         // Capture spawn time for metrics.
         let spawn_time = CLOCK.with_borrow_mut(fast_time::Clock::now);
 
         let processor_id = self.inner.hardware.current_processor_id();
 
-        // Ensure workers are spawned for this processor (lazy initialization).
-        self.inner.ensure_workers_spawned(processor_id);
-
-        let state = self.inner.registry.get_or_init(processor_id);
+        let state = self.inner.state_for_spawn(processor_id);
 
         // Rent a oneshot channel for the result.
         let (sender, receiver) = state.result_channel_pool.rent();
@@ -195,7 +206,10 @@ impl Scheduler {
         }
 
         // Record the spawn for metrics.
-        state.record_task_spawned();
+        state.record_task_spawned(urgent);
+
+        // Grow the worker pool if all current workers are occupied.
+        self.inner.ensure_worker_available(processor_id);
 
         // Notify one worker that work is available.
         state.wake_event.notify(1);
@@ -210,15 +224,23 @@ impl Scheduler {
     {
         use crate::wrap_task_and_forget;
 
+        let _admission = self.inner.admission.read().expect(NEVER_POISONED);
+
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            trace!(
+                pool_name = self.inner.pool_name.as_str(),
+                pool_id = self.inner.pool_id,
+                "rejected fire-and-forget task because pool shutdown has started"
+            );
+            return;
+        }
+
         // Capture spawn time for metrics.
         let spawn_time = CLOCK.with_borrow_mut(fast_time::Clock::now);
 
         let processor_id = self.inner.hardware.current_processor_id();
 
-        // Ensure workers are spawned for this processor (lazy initialization).
-        self.inner.ensure_workers_spawned(processor_id);
-
-        let state = self.inner.registry.get_or_init(processor_id);
+        let state = self.inner.state_for_spawn(processor_id);
 
         // Wrap the task to capture panics and log them.
         let wrapped = wrap_task_and_forget(task, spawn_time);
@@ -253,7 +275,10 @@ impl Scheduler {
         }
 
         // Record the spawn for metrics.
-        state.record_task_spawned();
+        state.record_task_spawned(urgent);
+
+        // Grow the worker pool if all current workers are occupied.
+        self.inner.ensure_worker_available(processor_id);
 
         // Notify one worker that work is available.
         state.wake_event.notify(1);
@@ -280,12 +305,10 @@ fn allocate_task<T: VicinalTask>(state: &ProcessorState, task: T) -> ErasedTaskH
 mod tests {
     use std::panic::{RefUnwindSafe, UnwindSafe};
 
+    use crate::{Pool, Scheduler};
     use events_once::EventPool;
     use futures::executor::block_on;
     use static_assertions::assert_impl_all;
-    use testing::assert_panics;
-
-    use crate::{Pool, Scheduler};
 
     assert_impl_all!(Scheduler: UnwindSafe, RefUnwindSafe);
 
@@ -297,7 +320,7 @@ mod tests {
         let handle = scheduler.spawn(|| 42);
         let result = block_on(handle);
 
-        assert_eq!(result, 42);
+        assert_eq!(result.unwrap(), 42);
     }
 
     #[test]
@@ -308,7 +331,7 @@ mod tests {
         let handle = scheduler.spawn_urgent(|| "urgent result");
         let result = block_on(handle);
 
-        assert_eq!(result, "urgent result");
+        assert_eq!(result.unwrap(), "urgent result");
     }
 
     #[test]
@@ -320,8 +343,8 @@ mod tests {
         let handle1 = scheduler.spawn(|| 1);
         let handle2 = scheduler2.spawn(|| 2);
 
-        assert_eq!(block_on(handle1), 1);
-        assert_eq!(block_on(handle2), 2);
+        assert_eq!(block_on(handle1).unwrap(), 1);
+        assert_eq!(block_on(handle2).unwrap(), 2);
     }
 
     #[test]
@@ -333,7 +356,7 @@ mod tests {
             panic!("test panic");
         });
 
-        assert_panics(|| block_on(handle));
+        assert!(block_on(handle).unwrap_err().is_panic());
     }
 
     #[test]
@@ -349,7 +372,7 @@ mod tests {
         });
 
         let result = block_on(handle);
-        assert_eq!(result, 42);
+        assert_eq!(result.unwrap(), 42);
     }
 
     #[test]

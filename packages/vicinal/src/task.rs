@@ -10,6 +10,7 @@ use fast_time::Instant;
 use pin_project::pin_project;
 use plurality::{Box as PoolBox, coerce};
 
+use crate::JoinError;
 use crate::metrics::{CLOCK, EXECUTION_TIME_MS, SCHEDULING_DELAY_MS};
 
 /// Unit of work handed to a worker thread.
@@ -52,7 +53,7 @@ pub(crate) fn init_task<T: VicinalTask>(
 
 /// Outcome of running a task to completion: either its return value or the payload of the
 /// panic that unwound out of it.
-pub(crate) type TaskResult<R> = Result<R, Box<dyn Any + Send>>;
+pub(crate) type TaskResult<R> = Result<R, JoinError>;
 
 /// Extracts a human-readable message from a panic payload.
 ///
@@ -121,7 +122,7 @@ where
 {
     TaskWrapper::new(
         move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(task));
+            let result = panic::catch_unwind(AssertUnwindSafe(task)).map_err(JoinError::panic);
             sender.send(result);
         },
         spawn_time,
@@ -260,7 +261,7 @@ mod tests {
         Box::pin(wrapped).as_mut().call();
 
         let result = block_on(receiver).unwrap();
-        let panic_payload = result.unwrap_err();
+        let panic_payload = result.unwrap_err().into_panic().unwrap();
 
         // The panic payload should contain our message.
         let message = panic_payload

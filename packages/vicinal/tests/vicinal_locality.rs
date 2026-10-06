@@ -55,7 +55,7 @@ fn tasks_execute_on_spawning_processor() {
             // Wait for all tasks to complete.
             for handle in task_handles {
                 // We use block_on from futures crate for simplicity in this example.
-                futures::executor::block_on(handle);
+                futures::executor::block_on(handle).unwrap();
             }
         }
     });
@@ -122,7 +122,7 @@ fn tasks_execute_on_spawning_processor_with_fake_hardware() {
                 }
 
                 for handle in task_handles {
-                    futures::executor::block_on(handle);
+                    futures::executor::block_on(handle).unwrap();
                 }
             }
         });

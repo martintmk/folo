@@ -1,7 +1,9 @@
 //! Join handle for awaiting task completion.
 
+use std::any::Any;
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
-use std::panic;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -9,16 +11,99 @@ use events_once::PooledReceiver;
 
 use crate::TaskResult;
 
+/// The reason a spawned task did not produce a value.
+pub struct JoinError {
+    kind: JoinErrorKind,
+}
+
+enum JoinErrorKind {
+    Shutdown,
+    Panic(Box<dyn Any + Send + 'static>),
+}
+
+impl JoinError {
+    pub(crate) fn shutdown() -> Self {
+        Self {
+            kind: JoinErrorKind::Shutdown,
+        }
+    }
+
+    pub(crate) fn panic(payload: Box<dyn Any + Send + 'static>) -> Self {
+        Self {
+            kind: JoinErrorKind::Panic(payload),
+        }
+    }
+
+    /// Returns `true` if the task was abandoned during pool shutdown.
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        matches!(&self.kind, JoinErrorKind::Shutdown)
+    }
+
+    /// Returns `true` if the task panicked.
+    #[must_use]
+    pub fn is_panic(&self) -> bool {
+        matches!(&self.kind, JoinErrorKind::Panic(_))
+    }
+
+    /// Returns the panic payload, if the task panicked.
+    #[must_use]
+    pub fn into_panic(self) -> Option<Box<dyn Any + Send + 'static>> {
+        match self.kind {
+            JoinErrorKind::Shutdown => None,
+            JoinErrorKind::Panic(payload) => Some(payload),
+        }
+    }
+
+    fn panic_message(&self) -> Option<&str> {
+        let JoinErrorKind::Panic(payload) = &self.kind else {
+            return None;
+        };
+
+        payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    }
+}
+
+impl fmt::Debug for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            JoinErrorKind::Shutdown => f.write_str("JoinError { shutdown: true }"),
+            JoinErrorKind::Panic(_) => f
+                .debug_struct("JoinError")
+                .field("panic", &true)
+                .field(
+                    "message",
+                    &self.panic_message().unwrap_or("unknown panic payload"),
+                )
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Display for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            JoinErrorKind::Shutdown => {
+                f.write_str("task was abandoned because the pool was shut down")
+            }
+            JoinErrorKind::Panic(_) => write!(
+                f,
+                "task panicked: {}",
+                self.panic_message().unwrap_or("unknown panic payload")
+            ),
+        }
+    }
+}
+
+impl Error for JoinError {}
+
 /// A handle to a spawned task that can be awaited to retrieve its result.
 ///
-/// Awaiting the join handle returns the task's return value. If the task panicked,
-/// awaiting the join handle will re-throw the panic.
-///
-/// # Panics
-///
-/// Awaiting the join handle panics if:
-/// - The task panicked (the panic is re-thrown).
-/// - The pool was shut down before the task could execute (the channel is disconnected).
+/// Awaiting the join handle returns the task's return value or a [`JoinError`] describing
+/// whether the task panicked or was abandoned during shutdown.
 #[derive(Debug)]
 pub struct JoinHandle<R>
 where
@@ -41,7 +126,7 @@ impl<R> Future for JoinHandle<R>
 where
     R: Send + 'static,
 {
-    type Output = R;
+    type Output = Result<R, JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let receiver = &mut self.receiver;
@@ -50,14 +135,8 @@ where
         match pinned_receiver.poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => match result {
-                Ok(Ok(value)) => Poll::Ready(value),
-                Ok(Err(panic_payload)) => {
-                    panic::resume_unwind(panic_payload);
-                }
-                Err(_disconnected) => {
-                    // Channel disconnected - pool was shut down.
-                    panic!("task was abandoned because the pool was shut down");
-                }
+                Ok(result) => Poll::Ready(result),
+                Err(_disconnected) => Poll::Ready(Err(JoinError::shutdown())),
             },
         }
     }
@@ -66,7 +145,7 @@ where
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
+    use std::panic::{self, AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
 
     use events_once::EventLake;
     use futures::executor::block_on;
@@ -86,7 +165,7 @@ mod tests {
         sender.send(Ok(42));
 
         let result = block_on(handle);
-        assert_eq!(result, 42);
+        assert_eq!(result.unwrap(), 42);
     }
 
     #[test]
@@ -97,12 +176,11 @@ mod tests {
 
         sender.send(Ok(()));
 
-        block_on(handle);
+        block_on(handle).unwrap();
     }
 
     #[test]
-    #[should_panic]
-    fn await_rethrows_panic() {
+    fn await_returns_panic_error() {
         let lake = EventLake::new();
         let (sender, receiver) = lake.rent::<TaskResult<()>>();
         let handle = JoinHandle::new(receiver);
@@ -112,14 +190,13 @@ mod tests {
             panic!("test panic");
         }));
 
-        sender.send(Err(panic_result.unwrap_err()));
+        sender.send(Err(JoinError::panic(panic_result.unwrap_err())));
 
-        block_on(handle);
+        assert!(block_on(handle).unwrap_err().is_panic());
     }
 
     #[test]
-    #[should_panic]
-    fn await_panics_on_disconnect() {
+    fn await_returns_shutdown_error_on_disconnect() {
         let lake = EventLake::new();
         let (sender, receiver) = lake.rent::<TaskResult<()>>();
         let handle = JoinHandle::new(receiver);
@@ -127,7 +204,7 @@ mod tests {
         // Drop sender without sending, simulating pool shutdown.
         drop(sender);
 
-        block_on(handle);
+        assert!(block_on(handle).unwrap_err().is_shutdown());
     }
 
     #[test]

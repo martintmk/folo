@@ -1,9 +1,10 @@
 # vicinal
 
-Processor-local worker pool that schedules tasks in the vicinity of the caller.
+Hardware-aware worker pool for processor-local and fixed processor-set execution.
 
-This crate provides a worker pool where each task is executed on the same processor that
-spawned it, ensuring optimal cache locality and minimizing cross-processor data movement.
+By default, each task is executed on the same processor that spawned it, ensuring optimal cache
+locality and minimizing cross-processor data movement. A fixed processor set can instead share one
+task queue across multiple processors.
 
 ## Example
 
@@ -18,19 +19,47 @@ async fn main() {
     let task1 = scheduler.spawn(|| 42);
     let _task2 = scheduler.spawn(|| println!("doing some stuff"));
 
-    assert_eq!(task1.await, 42);
+    assert_eq!(task1.await.unwrap(), 42);
 
     let scheduler2 = scheduler.clone();
     let task3 = scheduler.spawn(move || scheduler2.spawn(|| 55));
 
-    assert_eq!(task3.await.await, 55);
+    assert_eq!(task3.await.unwrap().await.unwrap(), 55);
 }
 ```
+
+## Configuration
+
+```rust
+use std::time::Duration;
+
+use many_cpus::SystemHardware;
+use new_zealand::nz;
+use vicinal::Pool;
+
+fn multi_processor_configuration() {
+    let pool = Pool::builder()
+        .processors(SystemHardware::current().processors())
+        .max_workers(nz!(4_usize))
+        .on_thread_start(initialize_worker)
+        .build();
+
+    // Returns immediately. New tasks are rejected from this point onward.
+    pool.start_shutdown(Duration::from_secs(5), Duration::from_secs(30));
+}
+
+fn initialize_worker() {}
+```
+
+`JoinHandle` resolves to `Result<T, JoinError>`. The opaque error reports whether the task
+panicked or was abandoned during shutdown.
 
 ## Tradeoffs
 
 - **Single task latency on an idle pool** is prioritized. The expectation is that tasks are
   short-lived so that the pool is often idle.
+- A fixed processor-set pool can be used as a general-purpose blocking pool, but it does not grow
+  dynamically. Every blocked task occupies one of the configured workers.
 
 ## Platform support
 

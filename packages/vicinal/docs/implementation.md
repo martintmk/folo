@@ -2,9 +2,9 @@
 
 User-visible behavior is defined in the package [design](design.md).
 
-The pool maintains a registry of state created on demand for processors that submit work.
-Each processor state owns its queues, wake and shutdown signals, task storage and result
-channels. Workers pinned to that processor consume only its state.
+Processor-local pools maintain a registry of state created on demand for processors that submit
+work. Each processor state owns its queues, wake and shutdown signals, task storage and result
+channels. Fixed processor-set pools use one shared state for all selected processors.
 
 ## Task storage
 
@@ -24,7 +24,17 @@ Normal and urgent queues are independent. A worker removes a task while holding 
 corresponding queue lock, then executes it after releasing the lock. User task code
 therefore runs without any processor-state lock held.
 
-Worker threads are created once per active processor and tracked by the owning pool.
-Shutdown prevents new worker creation, wakes existing workers and joins every worker
-thread. Result channels use a separate typed pool because their layout and lifecycle do
-not require heterogeneous task storage.
+Worker threads are created lazily and tracked by the owning pool. A submission reserves an idle
+worker when possible; otherwise it creates another worker until the scheduling domain reaches its
+maximum. Fixed processor-set workers are assigned across the selected processors in round-robin
+order. Worker initialization callbacks run after affinity is applied and before the work loop
+starts.
+
+Task admission is serialized against shutdown initiation so every task is either fully accepted
+or rejected. Timed shutdown advances workers from urgent-only draining to normal-only draining
+and finally stopping. Queue clearing drops result senders, which turns abandoned join handles
+into shutdown errors. Workers still executing after both deadlines are detached; their owned
+pool state remains alive until they return.
+
+Result channels use a separate typed pool because their layout and lifecycle do not require
+heterogeneous task storage.

@@ -2,9 +2,8 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{self, AtomicBool, Ordering};
 
-use crate::{ErasedTaskHandle, NEVER_POISONED};
+use crate::{ErasedTaskHandle, NEVER_POISONED, ProcessorState, ShutdownPhase};
 
 /// What one pass of a worker's main loop accomplished, and thus what the loop does next.
 ///
@@ -27,42 +26,46 @@ pub(crate) enum IterationResult {
 pub(crate) struct WorkerCore<'a> {
     urgent_queue: &'a Mutex<VecDeque<ErasedTaskHandle>>,
     regular_queue: &'a Mutex<VecDeque<ErasedTaskHandle>>,
-    shutdown_flag: &'a AtomicBool,
+    processor_state: &'a ProcessorState,
 }
 
 impl<'a> WorkerCore<'a> {
-    pub(crate) fn new(
-        urgent_queue: &'a Mutex<VecDeque<ErasedTaskHandle>>,
-        regular_queue: &'a Mutex<VecDeque<ErasedTaskHandle>>,
-        shutdown_flag: &'a AtomicBool,
-    ) -> Self {
+    pub(crate) fn new(processor_state: &'a ProcessorState) -> Self {
         Self {
-            urgent_queue,
-            regular_queue,
-            shutdown_flag,
+            urgent_queue: &processor_state.urgent_queue,
+            regular_queue: &processor_state.regular_queue,
+            processor_state,
         }
     }
 
     pub(crate) fn run_one_iteration(&self) -> IterationResult {
-        // We first check with Relaxed to minimize overhead, as this will be called often.
-        if self.shutdown_flag.load(Ordering::Relaxed) {
-            // Acquire ordering synchronizes with Release in signal_shutdown, ensuring we see
-            // the latest value of the shutdown flag after all prior writes from the signaler.
-            atomic::fence(Ordering::Acquire);
-
+        let shutdown_phase = self.processor_state.shutdown_phase();
+        if shutdown_phase == ShutdownPhase::Stopping {
             return IterationResult::Shutdown;
         }
 
-        let task = self.urgent_queue.lock().expect(NEVER_POISONED).pop_front();
-        if let Some(mut task) = task {
-            task.as_pin_mut().call();
-            return IterationResult::ExecutedUrgent;
+        if matches!(
+            shutdown_phase,
+            ShutdownPhase::Running | ShutdownPhase::DrainingUrgent
+        ) {
+            let task = self.urgent_queue.lock().expect(NEVER_POISONED).pop_front();
+            if let Some(mut task) = task {
+                task.as_pin_mut().call();
+                self.processor_state.record_task_completed(true);
+                return IterationResult::ExecutedUrgent;
+            }
         }
 
-        let task = self.regular_queue.lock().expect(NEVER_POISONED).pop_front();
-        if let Some(mut task) = task {
-            task.as_pin_mut().call();
-            return IterationResult::ExecutedRegular;
+        if matches!(
+            shutdown_phase,
+            ShutdownPhase::Running | ShutdownPhase::DrainingNormal
+        ) {
+            let task = self.regular_queue.lock().expect(NEVER_POISONED).pop_front();
+            if let Some(mut task) = task {
+                task.as_pin_mut().call();
+                self.processor_state.record_task_completed(false);
+                return IterationResult::ExecutedRegular;
+            }
         }
 
         IterationResult::WaitingForWork
@@ -73,7 +76,7 @@ impl<'a> WorkerCore<'a> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::pin::Pin;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use plurality::MultiPool;
 
@@ -111,24 +114,19 @@ mod tests {
 
     #[test]
     fn empty_queues_no_shutdown_returns_waiting() {
-        let urgent = Mutex::new(VecDeque::new());
-        let regular = Mutex::new(VecDeque::new());
-        let shutdown = AtomicBool::new(false);
-
-        let core = WorkerCore::new(&urgent, &regular, &shutdown);
+        let state = ProcessorState::new();
+        let core = WorkerCore::new(&state);
 
         assert_eq!(core.run_one_iteration(), IterationResult::WaitingForWork);
     }
 
     #[test]
-    fn empty_queues_with_shutdown_returns_shutdown() {
-        let urgent = Mutex::new(VecDeque::new());
-        let regular = Mutex::new(VecDeque::new());
-        let shutdown = AtomicBool::new(true);
+    fn empty_queues_while_draining_waits_for_next_phase() {
+        let state = ProcessorState::new();
+        state.set_shutdown_phase(ShutdownPhase::DrainingUrgent);
+        let core = WorkerCore::new(&state);
 
-        let core = WorkerCore::new(&urgent, &regular, &shutdown);
-
-        assert_eq!(core.run_one_iteration(), IterationResult::Shutdown);
+        assert_eq!(core.run_one_iteration(), IterationResult::WaitingForWork);
     }
 
     #[test]
@@ -137,14 +135,13 @@ mod tests {
         COUNTER.store(0, Ordering::Relaxed);
 
         let pool = MultiPool::new();
-        let urgent = Mutex::new(VecDeque::new());
-        let regular = Mutex::new(VecDeque::new());
-        let shutdown = AtomicBool::new(false);
+        let state = ProcessorState::new();
 
         let task = alloc_task(&pool, CountingTask::new(&COUNTER));
-        urgent.lock().unwrap().push_back(task);
+        state.urgent_queue.lock().unwrap().push_back(task);
+        state.record_task_spawned(true);
 
-        let core = WorkerCore::new(&urgent, &regular, &shutdown);
+        let core = WorkerCore::new(&state);
 
         assert_eq!(core.run_one_iteration(), IterationResult::ExecutedUrgent);
         assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
@@ -158,16 +155,16 @@ mod tests {
         REGULAR_COUNTER.store(0, Ordering::Relaxed);
 
         let pool = MultiPool::new();
-        let urgent = Mutex::new(VecDeque::new());
-        let regular = Mutex::new(VecDeque::new());
-        let shutdown = AtomicBool::new(false);
+        let state = ProcessorState::new();
 
         let urgent_task = alloc_task(&pool, CountingTask::new(&URGENT_COUNTER));
         let regular_task = alloc_task(&pool, CountingTask::new(&REGULAR_COUNTER));
-        urgent.lock().unwrap().push_back(urgent_task);
-        regular.lock().unwrap().push_back(regular_task);
+        state.urgent_queue.lock().unwrap().push_back(urgent_task);
+        state.regular_queue.lock().unwrap().push_back(regular_task);
+        state.record_task_spawned(true);
+        state.record_task_spawned(false);
 
-        let core = WorkerCore::new(&urgent, &regular, &shutdown);
+        let core = WorkerCore::new(&state);
 
         // First iteration should execute urgent task only.
         assert_eq!(core.run_one_iteration(), IterationResult::ExecutedUrgent);
@@ -181,36 +178,52 @@ mod tests {
         COUNTER.store(0, Ordering::Relaxed);
 
         let pool = MultiPool::new();
-        let urgent = Mutex::new(VecDeque::new());
-        let regular = Mutex::new(VecDeque::new());
-        let shutdown = AtomicBool::new(false);
+        let state = ProcessorState::new();
 
         let task = alloc_task(&pool, CountingTask::new(&COUNTER));
-        regular.lock().unwrap().push_back(task);
+        state.regular_queue.lock().unwrap().push_back(task);
+        state.record_task_spawned(false);
 
-        let core = WorkerCore::new(&urgent, &regular, &shutdown);
+        let core = WorkerCore::new(&state);
 
         assert_eq!(core.run_one_iteration(), IterationResult::ExecutedRegular);
         assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn shutdown_prevents_regular_task_execution() {
+    fn draining_urgent_prevents_regular_task_execution() {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         COUNTER.store(0, Ordering::Relaxed);
 
         let pool = MultiPool::new();
-        let urgent = Mutex::new(VecDeque::new());
-        let regular = Mutex::new(VecDeque::new());
-        let shutdown = AtomicBool::new(true);
+        let state = ProcessorState::new();
+        state.set_shutdown_phase(ShutdownPhase::DrainingUrgent);
 
         let task = alloc_task(&pool, CountingTask::new(&COUNTER));
-        regular.lock().unwrap().push_back(task);
+        state.regular_queue.lock().unwrap().push_back(task);
+        state.record_task_spawned(false);
 
-        let core = WorkerCore::new(&urgent, &regular, &shutdown);
+        let core = WorkerCore::new(&state);
 
-        // Shutdown takes priority over regular tasks.
-        assert_eq!(core.run_one_iteration(), IterationResult::Shutdown);
+        assert_eq!(core.run_one_iteration(), IterationResult::WaitingForWork);
         assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn draining_normal_executes_regular_tasks() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        COUNTER.store(0, Ordering::Relaxed);
+
+        let pool = MultiPool::new();
+        let state = ProcessorState::new();
+        state.set_shutdown_phase(ShutdownPhase::DrainingNormal);
+        let task = alloc_task(&pool, CountingTask::new(&COUNTER));
+        state.regular_queue.lock().unwrap().push_back(task);
+        state.record_task_spawned(false);
+
+        let core = WorkerCore::new(&state);
+
+        assert_eq!(core.run_one_iteration(), IterationResult::ExecutedRegular);
+        assert_eq!(COUNTER.load(Ordering::Relaxed), 1);
     }
 }
